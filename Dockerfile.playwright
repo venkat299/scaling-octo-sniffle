@@ -1,0 +1,12 @@
+FROM mcr.microsoft.com/playwright/python:v1.47.0-focal
+
+WORKDIR /app
+COPY camera-to-chatgpt-pipeline.py /app/app.py
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+EXPOSE 8000
+ENV BROWSER_MODE=true \
+    BROWSER_USER_DATA_DIR=/data/playwright
+RUN mkdir -p /data/playwright && chown -R pwuser:pwuser /data
+USER pwuser
+CMD ["python", "/app/app.py"]

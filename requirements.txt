@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+opencv-python
+pillow
+pytesseract
+requests
+pydantic
+openai
+playwright
+prometheus-client

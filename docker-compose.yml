@@ -1,0 +1,60 @@
+version: "3.9"
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: camera-llm:latest
+    container_name: camera-llm
+    restart: unless-stopped
+    environment:
+      CAPTURE_INTERVAL_SEC: ${CAPTURE_INTERVAL_SEC:-10}
+      CAMERA_INDEX: ${CAMERA_INDEX:-0}
+      CAMERA_RTSP_URL: ${CAMERA_RTSP_URL:-}
+      ANSWER_MODE: ${ANSWER_MODE:-local}
+      LOCAL_LLM_KIND: ${LOCAL_LLM_KIND:-ollama}
+      LOCAL_LLM_BASE_URL: ${LOCAL_LLM_BASE_URL:-http://ollama:11434}
+      LOCAL_LLM_MODEL: ${LOCAL_LLM_MODEL:-qwen2.5:7b}
+      VISION_MODE: ${VISION_MODE:-auto}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llava:7b}
+      WEBHOOK_URL: ${WEBHOOK_URL:-http://webhook:9000/inbox}
+      WEBHOOK_QUEUE_FILE: ${WEBHOOK_QUEUE_FILE:-/data/webhook_queue.jsonl}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      BROWSER_MODE: ${BROWSER_MODE:-false}
+      BROWSER_USER_DATA_DIR: ${BROWSER_USER_DATA_DIR:-/data/playwright}
+    ports:
+      - "8000:8000"
+    devices:
+      - "/dev/video0:/dev/video0"
+    volumes:
+      - appdata:/data
+    depends_on:
+      - ollama
+      - webhook
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    command: ["bash", "-lc", "ollama pull llava:7b && ollama pull qwen2.5:7b && ollama serve"]
+
+  webhook:
+    image: ghcr.io/sbynum/http-echo:latest
+    container_name: webhook
+    restart: unless-stopped
+    environment:
+      HTTP_ECHO_PATH: /inbox
+      HTTP_ECHO_STATUS: 200
+      HTTP_ECHO_METHODS: POST
+    ports:
+      - "9000:9000"
+
+volumes:
+  appdata:
+  ollama:
