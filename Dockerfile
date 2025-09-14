@@ -26,6 +26,10 @@ EXPOSE 8000
 ENV CAPTURE_INTERVAL_SEC=10 \
     CAMERA_INDEX=0 \
     CAMERA_RTSP_URL= \
+    MIRROR_HORIZONTAL=true \
+    ROTATE_DEG=0 \
+    KEYSTONE_TOP_INSET_PCT=0.10 \
+    KEYSTONE_BOTTOM_INSET_PCT=0.0 \
     ANSWER_MODE=local \
     LOCAL_LLM_KIND=ollama \
     LOCAL_LLM_BASE_URL=http://ollama:11434 \
@@ -33,20 +37,11 @@ ENV CAPTURE_INTERVAL_SEC=10 \
     VISION_MODE=auto \
     OLLAMA_BASE_URL=http://ollama:11434 \
     OLLAMA_MODEL=llava:7b \
-    WEBHOOK_URL=http://webhook:9000/inbox \
+    WEBHOOK_URL=http://webhook:80/inbox \
     WEBHOOK_QUEUE_FILE=/data/webhook_queue.jsonl \
     BROWSER_MODE=false
 
-# Healthcheck for /status
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD \
-  python - <<'PY' || exit 1
-import urllib.request, json
-try:
-  with urllib.request.urlopen('http://127.0.0.1:8000/status', timeout=3) as r:
-    data=json.load(r)
-    assert 'interval_sec' in data
-except Exception:
-  raise SystemExit(1)
-PY
+# Healthcheck for /status (single-line exec form)
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD ["python", "-c", "import urllib.request, json, sys\ntry:\n    with urllib.request.urlopen('http://127.0.0.1:8000/status', timeout=3) as r:\n        data = json.load(r)\n        sys.exit(0 if 'interval_sec' in data else 1)\nexcept Exception:\n    sys.exit(1)"]
 
 CMD ["python", "/app/app.py"]

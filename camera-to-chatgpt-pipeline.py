@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import time
+import sys
 from datetime import datetime
 from typing import Optional
 
@@ -14,7 +15,7 @@ import numpy as np
 import pytesseract
 import requests
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
 from openai import OpenAI
 import uvicorn
@@ -29,6 +30,14 @@ logging.basicConfig(level=logging.INFO)
 CAPTURE_INTERVAL_SEC = int(os.getenv("CAPTURE_INTERVAL_SEC", "10"))
 CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
 CAMERA_RTSP_URL = os.getenv("CAMERA_RTSP_URL", "")
+
+# Image transform controls
+MIRROR_HORIZONTAL = os.getenv("MIRROR_HORIZONTAL", "true").lower() in ("1", "true", "yes", "on")
+ROTATE_DEG = float(os.getenv("ROTATE_DEG", "0"))
+# For perspective keystone correction (camera low, tilted up => top appears narrower)
+# Value in [0, 0.4]; 0 disables.
+KEYSTONE_TOP_INSET_PCT = float(os.getenv("KEYSTONE_TOP_INSET_PCT", "0.10"))
+KEYSTONE_BOTTOM_INSET_PCT = float(os.getenv("KEYSTONE_BOTTOM_INSET_PCT", "0.0"))
 
 ANSWER_MODE = os.getenv("ANSWER_MODE", "api")  # api | local | browser
 LOCAL_LLM_KIND = os.getenv("LOCAL_LLM_KIND", "ollama")  # ollama | openai_compat
@@ -52,6 +61,8 @@ AUTO_CAPTURE = False
 last_problem: str = ""
 last_answer: str = ""
 webhook_url = WEBHOOK_URL
+last_image_original_b64: str = ""
+last_image_transformed_b64: str = ""
 
 # Prometheus metrics
 ANALYZER_LATENCY = Histogram("analyzer_latency_seconds", "Time spent analyzing frames")
@@ -104,6 +115,63 @@ def ocr_extract_text(img_bgr: np.ndarray) -> str:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     text = pytesseract.image_to_string(gray)
     return text.strip()
+
+
+def transform_frame(img_bgr: np.ndarray) -> np.ndarray:
+    """Apply mirror, rotation, and keystone correction to the frame.
+
+    - Mirror horizontally by default to undo typical webcam mirroring.
+    - Optional small rotation to correct tilt.
+    - Keystone correction to compensate for camera placed low and tilted up.
+    """
+    out = img_bgr
+
+    # Mirror horizontally
+    if MIRROR_HORIZONTAL:
+        out = cv2.flip(out, 1)
+
+    # Rotate if configured
+    if abs(ROTATE_DEG) > 0.01:
+        h, w = out.shape[:2]
+        M = cv2.getRotationMatrix2D((w / 2, h / 2), ROTATE_DEG, 1.0)
+        out = cv2.warpAffine(out, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+    # Keystone correction (top narrower than bottom)
+    h, w = out.shape[:2]
+    top_inset_px = int(max(0.0, min(KEYSTONE_TOP_INSET_PCT, 0.4)) * w)
+    bottom_inset_px = int(max(0.0, min(KEYSTONE_BOTTOM_INSET_PCT, 0.4)) * w)
+    if top_inset_px > 0 and bottom_inset_px == 0:
+        src = np.float32([
+            [top_inset_px, 0],
+            [w - 1 - top_inset_px, 0],
+            [w - 1, h - 1],
+            [0, h - 1],
+        ])
+        dst = np.float32([
+            [0, 0],
+            [w - 1, 0],
+            [w - 1, h - 1],
+            [0, h - 1],
+        ])
+        P = cv2.getPerspectiveTransform(src, dst)
+        out = cv2.warpPerspective(out, P, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    elif bottom_inset_px > 0 and top_inset_px == 0:
+        src = np.float32([
+            [0, 0],
+            [w - 1, 0],
+            [w - 1 - bottom_inset_px, h - 1],
+            [bottom_inset_px, h - 1],
+        ])
+        dst = np.float32([
+            [0, 0],
+            [w - 1, 0],
+            [w - 1, h - 1],
+            [0, h - 1],
+        ])
+        P = cv2.getPerspectiveTransform(src, dst)
+        out = cv2.warpPerspective(out, P, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+    return out
 
 
 def ollama_vision_summarize(jpeg_bytes: bytes) -> str:
@@ -247,36 +315,46 @@ def send_problem_to_chat(problem_statement: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def capture_frame() -> Optional[tuple[bytes, np.ndarray]]:
-    """Capture a frame from the configured camera."""
+def capture_images() -> Optional[tuple[bytes, bytes, np.ndarray]]:
+    """Capture one frame and return (orig_jpeg, transformed_jpeg, transformed_frame)."""
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened() and CAMERA_RTSP_URL:
         cap.release()
         cap = cv2.VideoCapture(CAMERA_RTSP_URL)
     if not cap.isOpened():
-        cap.release()
+        try:
+            cap.release()
+        except Exception:
+            pass
         return None
     ret, frame = cap.read()
     cap.release()
     if not ret:
         return None
-    success, buf = cv2.imencode(".jpg", frame)
-    if not success:
+    orig = frame
+    transformed = transform_frame(frame)
+    ok1, buf1 = cv2.imencode(".jpg", orig)
+    ok2, buf2 = cv2.imencode(".jpg", transformed)
+    if not (ok1 and ok2):
         return None
-    return buf.tobytes(), frame
+    return buf1.tobytes(), buf2.tobytes(), transformed
 
 
 def analyze_current_frame() -> str:
     """Capture a frame, extract a problem statement, and log latency."""
     start = time.time()
     try:
-        data = capture_frame()
+        data = capture_images()
         if not data:
             ANALYZER_ERRORS.inc()
             logging.info("Analyzer found no frame in %.2fs", time.time() - start)
             return "NO PROBLEM FOUND"
-        jpeg, frame = data
-        summary = extract_problem_statement(jpeg, frame)
+        orig_jpeg, transformed_jpeg, frame = data
+        # Persist images for display on index page
+        global last_image_original_b64, last_image_transformed_b64
+        last_image_original_b64 = "data:image/jpeg;base64," + base64.b64encode(orig_jpeg).decode("utf-8")
+        last_image_transformed_b64 = "data:image/jpeg;base64," + base64.b64encode(transformed_jpeg).decode("utf-8")
+        summary = extract_problem_statement(transformed_jpeg, frame)
         latency = time.time() - start
         ANALYZER_LATENCY.observe(latency)
         logging.info("Analyzer took %.2fs", latency)
@@ -359,8 +437,80 @@ def auto_loop() -> None:
         time.sleep(CAPTURE_INTERVAL_SEC)
 
 
-# Start background thread
-threading.Thread(target=auto_loop, daemon=True).start()
+def list_ollama_models(base_url: str) -> set:
+    """Return a set of model names available from an Ollama server."""
+    try:
+        r = requests.get(f"{base_url}/api/tags", timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        return {m.get("name", "") for m in data.get("models", [])}
+    except Exception:
+        return set()
+
+
+def wait_for_ollama_model(base_url: str, model: str, timeout_sec: int = 180) -> bool:
+    """Wait until a specific Ollama model is available via /api/tags."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        models = list_ollama_models(base_url)
+        if model in models:
+            return True
+        time.sleep(2)
+    return False
+
+
+def can_capture_once() -> bool:
+    """Try to open the configured camera/RTSP and grab a frame once."""
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened() and CAMERA_RTSP_URL:
+        cap.release()
+        cap = cv2.VideoCapture(CAMERA_RTSP_URL)
+    if not cap.isOpened():
+        return False
+    ret, _ = cap.read()
+    cap.release()
+    return bool(ret)
+
+
+def wait_for_camera_feed(timeout_sec: int = 45) -> bool:
+    """Wait until the camera/RTSP feed yields a frame."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if can_capture_once():
+            return True
+        time.sleep(2)
+    return False
+
+
+def run_startup_checks() -> None:
+    """Validate external dependencies before starting the server.
+
+    Fails fast if required LLM models are missing or the camera feed is unavailable.
+    """
+    # If using Ollama-backed vision, ensure the vision model exists
+    if VISION_MODE in ("auto", "ollama") and OLLAMA_BASE_URL and OLLAMA_MODEL:
+        logging.info("Waiting for Ollama vision model '%s' at %s", OLLAMA_MODEL, OLLAMA_BASE_URL)
+        if not wait_for_ollama_model(OLLAMA_BASE_URL, OLLAMA_MODEL):
+            logging.error("Required vision model '%s' not available at %s", OLLAMA_MODEL, OLLAMA_BASE_URL)
+            sys.exit(1)
+
+    # If answering locally via Ollama, ensure the chat model exists
+    if ANSWER_MODE == "local" and LOCAL_LLM_KIND == "ollama" and LOCAL_LLM_BASE_URL and LOCAL_LLM_MODEL:
+        logging.info("Waiting for Ollama chat model '%s' at %s", LOCAL_LLM_MODEL, LOCAL_LLM_BASE_URL)
+        if not wait_for_ollama_model(LOCAL_LLM_BASE_URL, LOCAL_LLM_MODEL):
+            logging.error("Required chat model '%s' not available at %s", LOCAL_LLM_MODEL, LOCAL_LLM_BASE_URL)
+            sys.exit(1)
+
+    # If using OpenAI API, ensure key exists (basic sanity)
+    if ANSWER_MODE == "api" and not OPENAI_API_KEY:
+        logging.error("ANSWER_MODE=api but OPENAI_API_KEY is not set")
+        sys.exit(1)
+
+    # Ensure a frame can be captured (index or RTSP)
+    logging.info("Checking camera/RTSP feed availability...")
+    if not wait_for_camera_feed():
+        logging.error("Camera/RTSP feed is not available. Set CAMERA_RTSP_URL or adjust CAMERA_INDEX.")
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +551,17 @@ async def index() -> str:
     <form action='/toggle_auto' method='post'><button type='submit'>Toggle Auto</button></form>
     <form action='/capture_now' method='post'><button type='submit'>Capture Now</button></form>
     <form action='/send' method='post'><button type='submit'>Send</button></form>
+    <div style="margin-top:16px; border-top:1px solid #ccc; padding-top:12px;">
+      <h3>Last Capture</h3>
+      <div style="display:{'block' if last_image_original_b64 else 'none'}; margin-bottom:8px;">
+        <div><strong>Original</strong></div>
+        <img src="{last_image_original_b64}" alt="original" style="max-width: 48vw; border:1px solid #ddd;" />
+      </div>
+      <div style="display:{'block' if last_image_transformed_b64 else 'none'};">
+        <div><strong>Transformed</strong></div>
+        <img src="{last_image_transformed_b64}" alt="transformed" style="max-width: 48vw; border:1px solid #ddd;" />
+      </div>
+    </div>
     </body>
     </html>
     """
@@ -415,22 +576,25 @@ async def toggle_auto() -> dict:
 
 
 @app.post("/capture_now")
-async def capture_now() -> dict:
-    """Manually capture and analyze a frame."""
+async def capture_now() -> RedirectResponse:
+    """Manually capture and analyze a frame, then return to index to display images."""
     global last_problem
     last_problem = analyze_current_frame()
-    return {"problem_statement": last_problem}
+    return RedirectResponse(url="/", status_code=303)
 
 
-@app.post("/send", response_model=SolveResponse)
-async def send() -> SolveResponse:
-    """Send the last captured problem to the solver."""
+@app.post("/send")
+async def send() -> RedirectResponse:
+    """Send the last captured problem to the solver and return to index page."""
     global last_answer
-    if not last_problem:
-        return SolveResponse(problem_statement="", answer="No problem captured")
-    last_answer = send_problem_to_chat(last_problem)
-    post_webhook(last_problem, last_answer)
-    return SolveResponse(problem_statement=last_problem, answer=last_answer)
+    if last_problem:
+        last_answer = send_problem_to_chat(last_problem)
+        post_webhook(last_problem, last_answer)
+    else:
+        # If no problem captured yet, keep last_answer as-is
+        pass
+    # Redirect back to the index so the page shows updated results
+    return RedirectResponse(url="/", status_code=303)
 
 
 class WebhookRequest(BaseModel):
@@ -446,4 +610,6 @@ async def set_webhook(req: WebhookRequest) -> dict:
 
 
 if __name__ == "__main__":
+    run_startup_checks()
+    threading.Thread(target=auto_loop, daemon=True).start()
     uvicorn.run(app, host="0.0.0.0", port=8000)
