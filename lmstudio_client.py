@@ -28,9 +28,21 @@ LMSTUDIO_MODEL = os.getenv("LMSTUDIO_MODEL", "")
 LMSTUDIO_API_KEY = os.getenv("LMSTUDIO_API_KEY", "")  # optional; LM Studio often doesn't require
 LMSTUDIO_TIMEOUT_SEC = int(os.getenv("LMSTUDIO_TIMEOUT_SEC", "120"))
 LMSTUDIO_VISION_MODEL = os.getenv("LMSTUDIO_VISION_MODEL", LMSTUDIO_MODEL)
-LMSTUDIO_MAX_TOKENS = int(os.getenv("LMSTUDIO_MAX_TOKENS", "512"))
+def _opt_int_env(name: str) -> Optional[int]:
+    v = os.getenv(name, "").strip()
+    if v == "":
+        return None
+    try:
+        n = int(v)
+        if n > 0:
+            return n
+    except Exception:
+        pass
+    return None
+
+LMSTUDIO_MAX_TOKENS = _opt_int_env("LMSTUDIO_MAX_TOKENS")
 LMSTUDIO_TEMPERATURE = float(os.getenv("LMSTUDIO_TEMPERATURE", "0.2"))
-LMSTUDIO_VISION_MAX_TOKENS = int(os.getenv("LMSTUDIO_VISION_MAX_TOKENS", "512"))
+LMSTUDIO_VISION_MAX_TOKENS = _opt_int_env("LMSTUDIO_VISION_MAX_TOKENS")
 LMSTUDIO_VISION_IMAGE_SIZE = int(os.getenv("LMSTUDIO_VISION_IMAGE_SIZE", "896"))
 LMSTUDIO_VISION_PAD_COLOR = os.getenv("LMSTUDIO_VISION_PAD_COLOR", "#000000")
 
@@ -76,8 +88,9 @@ def send_to_lmstudio(problem_statement: str) -> str:
             },
         ],
         "temperature": LMSTUDIO_TEMPERATURE,
-        "max_tokens": LMSTUDIO_MAX_TOKENS,
     }
+    if LMSTUDIO_MAX_TOKENS is not None:
+        payload["max_tokens"] = LMSTUDIO_MAX_TOKENS
 
     headers = _make_headers()
     last_err: Optional[str] = None
@@ -131,8 +144,9 @@ def lmstudio_vision_extract(jpeg_bytes: bytes) -> str:
             },
         ],
         "temperature": 0.0,
-        "max_tokens": LMSTUDIO_VISION_MAX_TOKENS,
     }
+    if LMSTUDIO_VISION_MAX_TOKENS is not None:
+        payload["max_tokens"] = LMSTUDIO_VISION_MAX_TOKENS
     headers = _make_headers()
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=LMSTUDIO_TIMEOUT_SEC)

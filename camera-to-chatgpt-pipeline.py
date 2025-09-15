@@ -11,7 +11,7 @@ import shutil
 import time
 import sys
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 import cv2
 import numpy as np
@@ -70,6 +70,9 @@ WEBHOOK_QUEUE_FILE = os.getenv("WEBHOOK_QUEUE_FILE", "/data/webhook_queue.jsonl"
 # ---------------------------------------------------------------------------
 
 AUTO_CAPTURE = False
+AUTO_SEND = False
+MULTI_CAPTURE = False
+last_problem_parts: List[str] = []
 last_problem: str = ""
 last_answer: str = ""
 webhook_url = WEBHOOK_URL
@@ -99,6 +102,8 @@ app = FastAPI()
 class Status(BaseModel):
     interval_sec: int
     auto_capture: bool
+    auto_send: bool
+    multi_capture: bool
     last_problem: str
     last_answer: str
     webhook_url: str
@@ -108,6 +113,8 @@ class Status(BaseModel):
     vision_mode: str
     vision_model: str
     camera_source: str
+    has_original: bool
+    has_transformed: bool
 
 
 @app.get("/status", response_model=Status)
@@ -135,6 +142,8 @@ async def get_status() -> Status:
     return Status(
         interval_sec=CAPTURE_INTERVAL_SEC,
         auto_capture=AUTO_CAPTURE,
+        auto_send=AUTO_SEND,
+        multi_capture=MULTI_CAPTURE,
         last_problem=last_problem,
         last_answer=last_answer,
         webhook_url=webhook_url,
@@ -144,6 +153,8 @@ async def get_status() -> Status:
         vision_mode=VISION_MODE,
         vision_model=vision_model,
         camera_source=last_camera_source,
+        has_original=last_image_original_bytes is not None,
+        has_transformed=last_image_transformed_bytes is not None,
     )
 
 
@@ -610,15 +621,21 @@ def post_webhook(problem: str, answer: str) -> None:
         logging.warning("Webhook failed; payload queued")
 
 
-def capture_and_send() -> None:
-    """Capture, analyze, send to solver, and notify webhook."""
-    global last_problem, last_answer, processing_state
+def capture_once() -> None:
+    """Capture and analyze a frame and optionally send to solver."""
+    global last_problem, last_answer, processing_state, last_problem_parts
     processing_state = "analyzing"
     try:
-        last_problem = analyze_current_frame()
-        processing_state = "solving"
-        last_answer = send_problem_to_chat(last_problem)
-        post_webhook(last_problem, last_answer)
+        new_text = analyze_current_frame()
+        if MULTI_CAPTURE:
+            last_problem_parts.append(new_text)
+            last_problem = "\n".join(last_problem_parts)
+        else:
+            last_problem = new_text
+        if AUTO_SEND and not MULTI_CAPTURE:
+            processing_state = "solving"
+            last_answer = send_problem_to_chat(last_problem)
+            post_webhook(last_problem, last_answer)
     finally:
         processing_state = "idle"
 
@@ -626,8 +643,8 @@ def capture_and_send() -> None:
 def auto_loop() -> None:
     """Background loop for automatic capture and solving."""
     while True:
-        if AUTO_CAPTURE:
-            capture_and_send()
+        if AUTO_CAPTURE and not MULTI_CAPTURE:
+            capture_once()
         time.sleep(CAPTURE_INTERVAL_SEC)
 
 
@@ -749,55 +766,128 @@ async def solve(req: SolveRequest) -> SolveResponse:
 
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
-    """Simple HTML control panel."""
+    """Responsive UI using Tailwind CSS."""
     return f"""
     <html>
-    <body>
-    <h1>Camera LLM</h1>
-    <p>Auto capture: <span id='auto_capture'>{AUTO_CAPTURE}</span></p>
-    <p>Processing: <span id='processing_state'>{processing_state}</span></p>
-    <p>Camera: <span id='camera_source'>{last_camera_source}</span></p>
-    <p>Answer mode: <span id='answer_mode'>{ANSWER_MODE}</span> <small><em id='answer_model'></em></small></p>
-    <p>Vision mode: <span id='vision_mode'>{VISION_MODE}</span> <small><em id='vision_model'></em></small></p>
-    <p>Last problem: <span id='last_problem'>{last_problem}</span></p>
-    <p>Last answer: <span id='last_answer'>{last_answer}</span></p>
-    <form action='/toggle_auto' method='post'><button type='submit'>Toggle Auto</button></form>
-    <form action='/capture_now' method='post'><button type='submit'>Capture Now</button></form>
-    <form action='/send' method='post'><button type='submit'>Send</button></form>
-    <div style="margin-top:16px; border-top:1px solid #ccc; padding-top:12px;">
-      <h3>Last Capture</h3>
-      <div style="display:flex; gap:12px; align-items:flex-start; flex-wrap:wrap;">
-        <div style="display:{'block' if last_image_original_b64 else 'none'};">
-          <div style="margin-bottom:4px;"><strong>Original</strong> <small>(raw)</small> — <a href='/original.jpg' target='_blank'>open</a></div>
-          <img src="{last_image_original_b64}" alt="original" style="max-width: 48vw; border:1px solid #ddd;" />
+    <head>
+      <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+      <script src="https://cdn.tailwindcss.com"></script>
+    </head>
+    <body class="h-screen flex text-sm">
+      <div id="content" class="flex-1 overflow-auto p-2">
+        <div id="problem" class="tab-pane"><pre id='last_problem' class="whitespace-pre-wrap break-words"></pre></div>
+        <div id="solution" class="tab-pane"><pre id='last_answer' class="whitespace-pre-wrap break-words"></pre></div>
+        <div id="status" class="tab-pane space-y-1">
+          <div>Processing: <span id='processing_state'></span></div>
+          <div>Camera: <span id='camera_source'></span></div>
+          <div>Answer mode: <span id='answer_mode'></span> <small id='answer_model'></small></div>
+          <div>Vision mode: <span id='vision_mode'></span> <small id='vision_model'></small></div>
+          <div>Auto capture: <span id='auto_capture'></span></div>
+          <div>Auto send: <span id='auto_send'></span></div>
+          <div>Multi capture: <span id='multi_capture'></span></div>
         </div>
-        <div style="display:{'block' if last_image_transformed_b64 else 'none'};">
-          <div style="margin-bottom:4px;"><strong>Transformed</strong> — <a href='/transformed.jpg' target='_blank'>open</a></div>
-          <img src="{last_image_transformed_b64}" alt="transformed" style="max-width: 48vw; border:1px solid #ddd;" />
+        <div id="images" class="tab-pane space-y-2">
+          <div id="orig_block" class="hidden">
+            <div class="text-xs font-bold">Original - <a href='/original.jpg' target='_blank' class="text-blue-600 underline">open</a></div>
+            <img id="img_original" class="w-full rounded" alt="original"/>
+          </div>
+          <div id="trans_block" class="hidden">
+            <div class="text-xs font-bold">Transformed - <a href='/transformed.jpg' target='_blank' class="text-blue-600 underline">open</a></div>
+            <img id="img_transformed" class="w-full rounded" alt="transformed"/>
+          </div>
+          <div class="text-[10px] font-mono text-gray-500">
+            MIRROR_HORIZONTAL={str(MIRROR_HORIZONTAL).lower()} | ROTATE_DEG={ROTATE_DEG} | KEYSTONE_TOP_INSET_PCT={KEYSTONE_TOP_INSET_PCT} | KEYSTONE_BOTTOM_INSET_PCT={KEYSTONE_BOTTOM_INSET_PCT}
+          </div>
         </div>
       </div>
-      <div style="margin-top:8px; color:#555; font-family: monospace; font-size: 12px;">
-        MIRROR_HORIZONTAL={str(MIRROR_HORIZONTAL).lower()} | ROTATE_DEG={ROTATE_DEG} | KEYSTONE_TOP_INSET_PCT={KEYSTONE_TOP_INSET_PCT} | KEYSTONE_BOTTOM_INSET_PCT={KEYSTONE_BOTTOM_INSET_PCT}
+      <div id="sidebar" class="w-28 flex flex-col border-l border-gray-300 p-2 justify-between">
+        <div id="tabs" class="flex flex-col space-y-1">
+          <button data-tab="problem" class="text-xs py-1 px-2 border rounded">Problem</button>
+          <button data-tab="solution" class="text-xs py-1 px-2 border rounded">Solution</button>
+          <button data-tab="status" class="text-xs py-1 px-2 border rounded">System</button>
+          <button data-tab="images" class="text-xs py-1 px-2 border rounded">Images</button>
+        </div>
+        <div id="controls" class="mt-4 flex flex-col space-y-1">
+          <button id='capture_btn' class="text-xs py-1 px-2 bg-blue-600 text-white rounded">Capture</button>
+          <button id='send_btn' class="text-xs py-1 px-2 bg-green-600 text-white rounded">Send</button>
+          <button id='toggle_auto_capture_btn' class="text-xs py-1 px-2 border rounded">Auto Capture</button>
+          <button id='toggle_auto_send_btn' class="text-xs py-1 px-2 border rounded">Auto Send</button>
+          <button id='toggle_multi_btn' class="text-xs py-1 px-2 border rounded">Multi</button>
+        </div>
       </div>
-    </div>
     <script>
+    function activateTab(id) {{
+      document.querySelectorAll('.tab-pane').forEach(p => p.classList.add('hidden'));
+      document.getElementById(id).classList.remove('hidden');
+    }}
+    document.querySelectorAll('#tabs button').forEach(btn => {{
+      btn.addEventListener('click', () => activateTab(btn.dataset.tab));
+    }});
+    activateTab('problem');
+
     async function refreshStatus() {{
       try {{
         const r = await fetch('/status');
         const s = await r.json();
-        document.getElementById('auto_capture').innerText = s.auto_capture;
+        document.getElementById('last_problem').innerText = s.last_problem;
+        document.getElementById('last_answer').innerText = s.last_answer;
         document.getElementById('processing_state').innerText = s.processing_state;
         document.getElementById('camera_source').innerText = s.camera_source || '';
         document.getElementById('answer_mode').innerText = s.answer_mode;
         document.getElementById('answer_model').innerText = s.answer_model ? '(' + s.answer_model + ')' : '';
         document.getElementById('vision_mode').innerText = s.vision_mode;
         document.getElementById('vision_model').innerText = s.vision_model ? '(' + s.vision_model + ')' : '';
-        document.getElementById('last_problem').innerText = s.last_problem;
-        document.getElementById('last_answer').innerText = s.last_answer;
+        document.getElementById('auto_capture').innerText = s.auto_capture;
+        document.getElementById('auto_send').innerText = s.auto_send;
+        document.getElementById('multi_capture').innerText = s.multi_capture;
+        if (s.has_original) {{
+          document.getElementById('orig_block').classList.remove('hidden');
+          document.getElementById('img_original').src = '/original.jpg?ts=' + Date.now();
+        }}
+        if (s.has_transformed) {{
+          document.getElementById('trans_block').classList.remove('hidden');
+          document.getElementById('img_transformed').src = '/transformed.jpg?ts=' + Date.now();
+        }}
       }} catch (e) {{
         console.error('status update failed', e);
       }}
     }}
+
+    async function doCapture() {{
+      const r = await fetch('/capture_now', {{method:'POST'}});
+      const d = await r.json();
+      await refreshStatus();
+      activateTab(d.tab || 'problem');
+    }}
+
+    async function doSend() {{
+      const r = await fetch('/send', {{method:'POST'}});
+      const d = await r.json();
+      await refreshStatus();
+      activateTab(d.tab || 'solution');
+    }}
+
+    async function toggleAutoCapture() {{
+      await fetch('/toggle_auto_capture', {{method:'POST'}});
+      await refreshStatus();
+    }}
+
+    async function toggleAutoSend() {{
+      await fetch('/toggle_auto_send', {{method:'POST'}});
+      await refreshStatus();
+    }}
+
+    async function toggleMulti() {{
+      await fetch('/toggle_multi', {{method:'POST'}});
+      await refreshStatus();
+    }}
+
+    document.getElementById('capture_btn').onclick = doCapture;
+    document.getElementById('send_btn').onclick = doSend;
+    document.getElementById('toggle_auto_capture_btn').onclick = toggleAutoCapture;
+    document.getElementById('toggle_auto_send_btn').onclick = toggleAutoSend;
+    document.getElementById('toggle_multi_btn').onclick = toggleMulti;
+
     setInterval(refreshStatus, 1000);
     refreshStatus();
     </script>
@@ -822,30 +912,50 @@ async def get_transformed_jpeg() -> Response:
     return PlainTextResponse("No image captured yet", status_code=404)
 
 
-@app.post("/toggle_auto")
-async def toggle_auto() -> dict:
+@app.post("/toggle_auto_capture")
+async def toggle_auto_capture() -> dict:
     """Toggle automatic capture."""
     global AUTO_CAPTURE
     AUTO_CAPTURE = not AUTO_CAPTURE
     return {"auto_capture": AUTO_CAPTURE}
 
 
+@app.post("/toggle_auto_send")
+async def toggle_auto_send() -> dict:
+    """Toggle automatic sending after capture."""
+    global AUTO_SEND
+    AUTO_SEND = not AUTO_SEND
+    return {"auto_send": AUTO_SEND}
+
+
+@app.post("/toggle_multi")
+async def toggle_multi() -> dict:
+    """Toggle multi-capture mode (disables auto modes)."""
+    global MULTI_CAPTURE, AUTO_CAPTURE, AUTO_SEND, last_problem_parts
+    MULTI_CAPTURE = not MULTI_CAPTURE
+    if MULTI_CAPTURE:
+        AUTO_CAPTURE = False
+        AUTO_SEND = False
+        last_problem_parts = []
+    return {
+        "multi_capture": MULTI_CAPTURE,
+        "auto_capture": AUTO_CAPTURE,
+        "auto_send": AUTO_SEND,
+    }
+
+
 @app.post("/capture_now")
-async def capture_now() -> RedirectResponse:
-    """Manually capture and analyze a frame, then return to index to display images."""
-    global last_problem, processing_state
-    processing_state = "analyzing"
-    try:
-        last_problem = analyze_current_frame()
-    finally:
-        processing_state = "idle"
-    return RedirectResponse(url="/", status_code=303)
+async def capture_now() -> dict:
+    """Manually capture and analyze a frame."""
+    capture_once()
+    tab = "solution" if (AUTO_SEND and not MULTI_CAPTURE) else "problem"
+    return {"tab": tab}
 
 
 @app.post("/send")
-async def send() -> RedirectResponse:
-    """Send the last captured problem to the solver and return to index page."""
-    global last_answer, processing_state
+async def send() -> dict:
+    """Send the last captured problem to the solver."""
+    global last_answer, processing_state, last_problem_parts
     if last_problem:
         processing_state = "solving"
         try:
@@ -853,10 +963,8 @@ async def send() -> RedirectResponse:
             post_webhook(last_problem, last_answer)
         finally:
             processing_state = "idle"
-    else:
-        processing_state = "idle"
-    # Redirect back to the index so the page shows updated results
-    return RedirectResponse(url="/", status_code=303)
+        last_problem_parts = []
+    return {"tab": "solution"}
 
 
 class WebhookRequest(BaseModel):
