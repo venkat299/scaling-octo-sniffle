@@ -5,6 +5,9 @@ import json
 import logging
 import os
 import threading
+import subprocess
+import tempfile
+import shutil
 import time
 import sys
 from datetime import datetime
@@ -15,9 +18,10 @@ import numpy as np
 import pytesseract
 import requests
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from pydantic import BaseModel
 from openai import OpenAI
+from lmstudio_client import send_to_lmstudio, lmstudio_vision_extract
 import uvicorn
 from prometheus_client import Counter, Histogram, generate_latest
 
@@ -30,13 +34,21 @@ logging.basicConfig(level=logging.INFO)
 CAPTURE_INTERVAL_SEC = int(os.getenv("CAPTURE_INTERVAL_SEC", "10"))
 CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
 CAMERA_RTSP_URL = os.getenv("CAMERA_RTSP_URL", "")
+MACOS_CAPTURE_TOOL = os.getenv("MACOS_CAPTURE_TOOL", "auto")  # auto | imagesnap | ffmpeg | off
+IMAGESNAP_DEVICE = os.getenv("IMAGESNAP_DEVICE", "")  # optional device name for imagesnap
+IMAGESNAP_WARMUP = os.getenv("IMAGESNAP_WARMUP", "1")  # seconds to warm up imagesnap
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
+AVFOUNDATION_DEVICE = os.getenv("AVFOUNDATION_DEVICE", "0:")  # e.g. "0:" video only
+AVFOUNDATION_FRAMERATE = os.getenv("AVFOUNDATION_FRAMERATE", "30")
+AVFOUNDATION_SIZE = os.getenv("AVFOUNDATION_SIZE", "")  # e.g. "1280x720" (optional)
 
 # Image transform controls
-MIRROR_HORIZONTAL = os.getenv("MIRROR_HORIZONTAL", "true").lower() in ("1", "true", "yes", "on")
+# Default to false since many cameras already provide an unmirrored feed.
+MIRROR_HORIZONTAL = os.getenv("MIRROR_HORIZONTAL", "false").lower() in ("1", "true", "yes", "on")
 ROTATE_DEG = float(os.getenv("ROTATE_DEG", "0"))
 # For perspective keystone correction (camera low, tilted up => top appears narrower)
-# Value in [0, 0.4]; 0 disables.
-KEYSTONE_TOP_INSET_PCT = float(os.getenv("KEYSTONE_TOP_INSET_PCT", "0.10"))
+# Value in [0, 0.4]; 0 disables and is the default.
+KEYSTONE_TOP_INSET_PCT = float(os.getenv("KEYSTONE_TOP_INSET_PCT", "0.0"))
 KEYSTONE_BOTTOM_INSET_PCT = float(os.getenv("KEYSTONE_BOTTOM_INSET_PCT", "0.0"))
 
 ANSWER_MODE = os.getenv("ANSWER_MODE", "api")  # api | local | browser
@@ -44,7 +56,7 @@ LOCAL_LLM_KIND = os.getenv("LOCAL_LLM_KIND", "ollama")  # ollama | openai_compat
 LOCAL_LLM_BASE_URL = os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:11434")
 LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "qwen2.5:7b")
 
-VISION_MODE = os.getenv("VISION_MODE", "auto")  # auto | ocr | ollama
+VISION_MODE = os.getenv("VISION_MODE", "auto")  # auto | ocr | ollama | lmstudio
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llava:7b")
 
@@ -63,6 +75,11 @@ last_answer: str = ""
 webhook_url = WEBHOOK_URL
 last_image_original_b64: str = ""
 last_image_transformed_b64: str = ""
+# Keep raw JPEG bytes for direct download/debug viewing
+last_image_original_bytes: Optional[bytes] = None
+last_image_transformed_bytes: Optional[bytes] = None
+processing_state: str = "idle"
+last_camera_source: str = ""
 
 # Prometheus metrics
 ANALYZER_LATENCY = Histogram("analyzer_latency_seconds", "Time spent analyzing frames")
@@ -85,17 +102,48 @@ class Status(BaseModel):
     last_problem: str
     last_answer: str
     webhook_url: str
+    processing_state: str
+    answer_mode: str
+    answer_model: str
+    vision_mode: str
+    vision_model: str
+    camera_source: str
 
 
 @app.get("/status", response_model=Status)
 async def get_status() -> Status:
     """Return basic status including capture interval."""
+    # Resolve model labels based on configured modes
+    if ANSWER_MODE == "lmstudio":
+        answer_model = os.getenv("LMSTUDIO_MODEL", "") or ""
+    elif ANSWER_MODE == "local":
+        answer_model = LOCAL_LLM_MODEL
+    elif ANSWER_MODE == "api":
+        answer_model = OPENAI_MODEL
+    else:
+        answer_model = ""
+
+    if VISION_MODE == "lmstudio":
+        vision_model = os.getenv("LMSTUDIO_VISION_MODEL", "") or os.getenv("LMSTUDIO_MODEL", "") or ""
+    elif VISION_MODE == "ollama":
+        vision_model = OLLAMA_MODEL
+    elif VISION_MODE == "ocr":
+        vision_model = "tesseract"
+    else:
+        vision_model = "auto"
+
     return Status(
         interval_sec=CAPTURE_INTERVAL_SEC,
         auto_capture=AUTO_CAPTURE,
         last_problem=last_problem,
         last_answer=last_answer,
         webhook_url=webhook_url,
+        processing_state=processing_state,
+        answer_mode=ANSWER_MODE,
+        answer_model=answer_model,
+        vision_mode=VISION_MODE,
+        vision_model=vision_model,
+        camera_source=last_camera_source,
     )
 
 
@@ -118,9 +166,9 @@ def ocr_extract_text(img_bgr: np.ndarray) -> str:
 
 
 def transform_frame(img_bgr: np.ndarray) -> np.ndarray:
-    """Apply mirror, rotation, and keystone correction to the frame.
+    """Apply optional mirror, rotation, and keystone correction to the frame.
 
-    - Mirror horizontally by default to undo typical webcam mirroring.
+    - Mirror horizontally if configured.
     - Optional small rotation to correct tilt.
     - Keystone correction to compensate for camera placed low and tilted up.
     """
@@ -174,6 +222,93 @@ def transform_frame(img_bgr: np.ndarray) -> np.ndarray:
     return out
 
 
+def capture_macos_jpeg() -> Optional[bytes]:
+    """Capture one JPEG using macOS CLI tools (imagesnap or ffmpeg/avfoundation).
+
+    Returns JPEG bytes or None if unavailable. This can trigger macOS camera
+    permission prompts which sometimes do not appear for OpenCV processes.
+    """
+    if sys.platform != "darwin" or MACOS_CAPTURE_TOOL == "off":
+        return None
+
+    # Try imagesnap first unless explicitly set to ffmpeg
+    if MACOS_CAPTURE_TOOL in ("auto", "imagesnap"):
+        imagesnap = shutil.which("imagesnap")
+        if imagesnap:
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
+                    tmp_path = tf.name
+                try:
+                    cmd = [imagesnap, "-q", "-w", IMAGESNAP_WARMUP]
+                    if IMAGESNAP_DEVICE:
+                        cmd += ["-d", IMAGESNAP_DEVICE]
+                    cmd += [tmp_path]
+                    subprocess.run(
+                        cmd,
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=15,
+                    )
+                    with open(tmp_path, "rb") as f:
+                        data = f.read()
+                    return data if data else None
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+            except Exception:
+                logging.exception("imagesnap capture failed")
+
+    # Fallback: ffmpeg avfoundation
+    if MACOS_CAPTURE_TOOL in ("auto", "ffmpeg"):
+        ffmpeg = shutil.which(FFMPEG_BIN)
+        if ffmpeg:
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
+                    tmp_path = tf.name
+                try:
+                    cmd = [
+                        ffmpeg,
+                        "-y",
+                        "-f",
+                        "avfoundation",
+                        "-framerate",
+                        AVFOUNDATION_FRAMERATE,
+                    ]
+                    if AVFOUNDATION_SIZE:
+                        cmd += ["-video_size", AVFOUNDATION_SIZE]
+                    cmd += [
+                        "-i",
+                        AVFOUNDATION_DEVICE,
+                        "-frames:v",
+                        "1",
+                        "-vcodec",
+                        "mjpeg",
+                        tmp_path,
+                    ]
+                    subprocess.run(
+                        cmd,
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=20,
+                    )
+                    with open(tmp_path, "rb") as f:
+                        data = f.read()
+                    return data if data else None
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+            except Exception:
+                logging.exception("ffmpeg avfoundation capture failed")
+
+    return None
+
+
 def ollama_vision_summarize(jpeg_bytes: bytes) -> str:
     """Summarize an image using an Ollama vision model."""
     b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
@@ -193,15 +328,31 @@ def ollama_vision_summarize(jpeg_bytes: bytes) -> str:
 
 
 def extract_problem_statement(jpeg: bytes, img_bgr: np.ndarray) -> str:
-    """Derive a problem statement from an image using vision/OCR."""
+    """Derive a problem statement from an image using LM Studio vision or OCR.
+
+    Order of attempts:
+    - If VISION_MODE=lmstudio or auto: try LM Studio vision first.
+    - If VISION_MODE=ollama or auto (and not found): try Ollama vision.
+    - If VISION_MODE=ocr (and not found in previous): use Tesseract OCR.
+    """
     summary: Optional[str] = None
-    if VISION_MODE in ("auto", "ollama"):
+
+    # LM Studio multimodal (preferred when enabled)
+    if VISION_MODE in ("auto", "lmstudio"):
+        try:
+            summary = lmstudio_vision_extract(jpeg)
+        except Exception:
+            logging.exception("LM Studio vision extraction errored")
+
+    # Ollama vision fallback
+    if (VISION_MODE in ("auto", "ollama")) and (not summary or not summary.strip()):
         summary = ollama_vision_summarize(jpeg)
-    if VISION_MODE in ("auto", "ocr") and (
-        not summary or summary.upper() == "NO PROBLEM FOUND"
-    ):
+
+    # OCR fallback only if explicitly requested or nothing found in auto
+    if (VISION_MODE in ("auto", "ocr")) and (not summary or not summary.strip()):
         txt = ocr_extract_text(img_bgr)
         summary = txt if txt else "NO PROBLEM FOUND"
+
     return summary or "NO PROBLEM FOUND"
 
 
@@ -294,6 +445,9 @@ def send_problem_to_chat(problem_statement: str) -> str:
         if ANSWER_MODE == "browser":
             backend = "browser"
             answer = send_to_chatgpt_browser(problem_statement)
+        elif ANSWER_MODE == "lmstudio":
+            backend = "lmstudio"
+            answer = send_to_lmstudio(problem_statement)
         elif ANSWER_MODE == "local":
             backend = "local"
             answer = send_to_local_llm(problem_statement)
@@ -316,28 +470,61 @@ def send_problem_to_chat(problem_statement: str) -> str:
 
 
 def capture_images() -> Optional[tuple[bytes, bytes, np.ndarray]]:
-    """Capture one frame and return (orig_jpeg, transformed_jpeg, transformed_frame)."""
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened() and CAMERA_RTSP_URL:
-        cap.release()
-        cap = cv2.VideoCapture(CAMERA_RTSP_URL)
-    if not cap.isOpened():
+    """Capture one frame and return (orig_jpeg, transformed_jpeg, transformed_frame).
+
+    Attempts OpenCV first; on failure (common on macOS due to privacy
+    permissions), falls back to macOS CLI tools if available.
+    """
+    # Try OpenCV device or RTSP first
+    global last_camera_source
+    try:
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        if not cap.isOpened() and CAMERA_RTSP_URL:
+            cap.release()
+            cap = cv2.VideoCapture(CAMERA_RTSP_URL)
+        if cap.isOpened():
+            ret, frame = cap.read()
+            cap.release()
+            if ret:
+                orig = frame.copy()
+                transformed = transform_frame(orig.copy())
+                ok1, buf1 = cv2.imencode(".jpg", orig)
+                ok2, buf2 = cv2.imencode(".jpg", transformed)
+                if ok1 and ok2:
+                    # Determine source label
+                    if CAMERA_RTSP_URL and CAMERA_RTSP_URL.strip():
+                        last_camera_source = f"opencv:rtsp {CAMERA_RTSP_URL}"
+                    else:
+                        last_camera_source = f"opencv:index {CAMERA_INDEX}"
+                    return buf1.tobytes(), buf2.tobytes(), transformed
+    except Exception:
         try:
             cap.release()
         except Exception:
             pass
-        return None
-    ret, frame = cap.read()
-    cap.release()
-    if not ret:
-        return None
-    orig = frame
-    transformed = transform_frame(frame)
-    ok1, buf1 = cv2.imencode(".jpg", orig)
-    ok2, buf2 = cv2.imencode(".jpg", transformed)
-    if not (ok1 and ok2):
-        return None
-    return buf1.tobytes(), buf2.tobytes(), transformed
+
+    # Fallback to macOS CLI capture
+    mac_jpeg = capture_macos_jpeg()
+    if mac_jpeg:
+        arr = np.frombuffer(mac_jpeg, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return None
+        orig = frame.copy()
+        transformed = transform_frame(orig.copy())
+        ok2, buf2 = cv2.imencode(".jpg", transformed)
+        if ok2:
+            # Record macOS source info
+            if MACOS_CAPTURE_TOOL in ("auto", "imagesnap") and shutil.which("imagesnap"):
+                dev = IMAGESNAP_DEVICE or "default"
+                last_camera_source = f"macos:imagesnap {dev}"
+            elif MACOS_CAPTURE_TOOL in ("auto", "ffmpeg") and shutil.which(FFMPEG_BIN):
+                last_camera_source = f"macos:ffmpeg avfoundation {AVFOUNDATION_DEVICE}"
+            else:
+                last_camera_source = "macos:unknown"
+            return mac_jpeg, buf2.tobytes(), transformed
+
+    return None
 
 
 def analyze_current_frame() -> str:
@@ -350,10 +537,12 @@ def analyze_current_frame() -> str:
             logging.info("Analyzer found no frame in %.2fs", time.time() - start)
             return "NO PROBLEM FOUND"
         orig_jpeg, transformed_jpeg, frame = data
-        # Persist images for display on index page
-        global last_image_original_b64, last_image_transformed_b64
+        # Persist images for display on index page and for direct download
+        global last_image_original_b64, last_image_transformed_b64, last_image_original_bytes, last_image_transformed_bytes
         last_image_original_b64 = "data:image/jpeg;base64," + base64.b64encode(orig_jpeg).decode("utf-8")
         last_image_transformed_b64 = "data:image/jpeg;base64," + base64.b64encode(transformed_jpeg).decode("utf-8")
+        last_image_original_bytes = orig_jpeg
+        last_image_transformed_bytes = transformed_jpeg
         summary = extract_problem_statement(transformed_jpeg, frame)
         latency = time.time() - start
         ANALYZER_LATENCY.observe(latency)
@@ -423,10 +612,15 @@ def post_webhook(problem: str, answer: str) -> None:
 
 def capture_and_send() -> None:
     """Capture, analyze, send to solver, and notify webhook."""
-    global last_problem, last_answer
-    last_problem = analyze_current_frame()
-    last_answer = send_problem_to_chat(last_problem)
-    post_webhook(last_problem, last_answer)
+    global last_problem, last_answer, processing_state
+    processing_state = "analyzing"
+    try:
+        last_problem = analyze_current_frame()
+        processing_state = "solving"
+        last_answer = send_problem_to_chat(last_problem)
+        post_webhook(last_problem, last_answer)
+    finally:
+        processing_state = "idle"
 
 
 def auto_loop() -> None:
@@ -460,16 +654,31 @@ def wait_for_ollama_model(base_url: str, model: str, timeout_sec: int = 180) -> 
 
 
 def can_capture_once() -> bool:
-    """Try to open the configured camera/RTSP and grab a frame once."""
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened() and CAMERA_RTSP_URL:
-        cap.release()
-        cap = cv2.VideoCapture(CAMERA_RTSP_URL)
-    if not cap.isOpened():
-        return False
-    ret, _ = cap.read()
-    cap.release()
-    return bool(ret)
+    """Try to open the configured camera/RTSP and grab a frame once.
+
+    Includes macOS CLI fallback so startup checks pass when OpenCV cannot
+    trigger camera permissions.
+    """
+    try:
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        if not cap.isOpened() and CAMERA_RTSP_URL:
+            cap.release()
+            cap = cv2.VideoCapture(CAMERA_RTSP_URL)
+        if cap.isOpened():
+            ret, _ = cap.read()
+            cap.release()
+            if ret:
+                return True
+    except Exception:
+        try:
+            cap.release()
+        except Exception:
+            pass
+
+    # macOS fallback
+    if sys.platform == "darwin" and capture_macos_jpeg():
+        return True
+    return False
 
 
 def wait_for_camera_feed(timeout_sec: int = 45) -> bool:
@@ -545,26 +754,72 @@ async def index() -> str:
     <html>
     <body>
     <h1>Camera LLM</h1>
-    <p>Auto capture: {AUTO_CAPTURE}</p>
-    <p>Last problem: {last_problem}</p>
-    <p>Last answer: {last_answer}</p>
+    <p>Auto capture: <span id='auto_capture'>{AUTO_CAPTURE}</span></p>
+    <p>Processing: <span id='processing_state'>{processing_state}</span></p>
+    <p>Camera: <span id='camera_source'>{last_camera_source}</span></p>
+    <p>Answer mode: <span id='answer_mode'>{ANSWER_MODE}</span> <small><em id='answer_model'></em></small></p>
+    <p>Vision mode: <span id='vision_mode'>{VISION_MODE}</span> <small><em id='vision_model'></em></small></p>
+    <p>Last problem: <span id='last_problem'>{last_problem}</span></p>
+    <p>Last answer: <span id='last_answer'>{last_answer}</span></p>
     <form action='/toggle_auto' method='post'><button type='submit'>Toggle Auto</button></form>
     <form action='/capture_now' method='post'><button type='submit'>Capture Now</button></form>
     <form action='/send' method='post'><button type='submit'>Send</button></form>
     <div style="margin-top:16px; border-top:1px solid #ccc; padding-top:12px;">
       <h3>Last Capture</h3>
-      <div style="display:{'block' if last_image_original_b64 else 'none'}; margin-bottom:8px;">
-        <div><strong>Original</strong></div>
-        <img src="{last_image_original_b64}" alt="original" style="max-width: 48vw; border:1px solid #ddd;" />
+      <div style="display:flex; gap:12px; align-items:flex-start; flex-wrap:wrap;">
+        <div style="display:{'block' if last_image_original_b64 else 'none'};">
+          <div style="margin-bottom:4px;"><strong>Original</strong> <small>(raw)</small> — <a href='/original.jpg' target='_blank'>open</a></div>
+          <img src="{last_image_original_b64}" alt="original" style="max-width: 48vw; border:1px solid #ddd;" />
+        </div>
+        <div style="display:{'block' if last_image_transformed_b64 else 'none'};">
+          <div style="margin-bottom:4px;"><strong>Transformed</strong> — <a href='/transformed.jpg' target='_blank'>open</a></div>
+          <img src="{last_image_transformed_b64}" alt="transformed" style="max-width: 48vw; border:1px solid #ddd;" />
+        </div>
       </div>
-      <div style="display:{'block' if last_image_transformed_b64 else 'none'};">
-        <div><strong>Transformed</strong></div>
-        <img src="{last_image_transformed_b64}" alt="transformed" style="max-width: 48vw; border:1px solid #ddd;" />
+      <div style="margin-top:8px; color:#555; font-family: monospace; font-size: 12px;">
+        MIRROR_HORIZONTAL={str(MIRROR_HORIZONTAL).lower()} | ROTATE_DEG={ROTATE_DEG} | KEYSTONE_TOP_INSET_PCT={KEYSTONE_TOP_INSET_PCT} | KEYSTONE_BOTTOM_INSET_PCT={KEYSTONE_BOTTOM_INSET_PCT}
       </div>
     </div>
+    <script>
+    async function refreshStatus() {{
+      try {{
+        const r = await fetch('/status');
+        const s = await r.json();
+        document.getElementById('auto_capture').innerText = s.auto_capture;
+        document.getElementById('processing_state').innerText = s.processing_state;
+        document.getElementById('camera_source').innerText = s.camera_source || '';
+        document.getElementById('answer_mode').innerText = s.answer_mode;
+        document.getElementById('answer_model').innerText = s.answer_model ? '(' + s.answer_model + ')' : '';
+        document.getElementById('vision_mode').innerText = s.vision_mode;
+        document.getElementById('vision_model').innerText = s.vision_model ? '(' + s.vision_model + ')' : '';
+        document.getElementById('last_problem').innerText = s.last_problem;
+        document.getElementById('last_answer').innerText = s.last_answer;
+      }} catch (e) {{
+        console.error('status update failed', e);
+      }}
+    }}
+    setInterval(refreshStatus, 1000);
+    refreshStatus();
+    </script>
     </body>
     </html>
     """
+
+
+@app.get("/original.jpg")
+async def get_original_jpeg() -> Response:
+    """Return the last raw-captured JPEG."""
+    if last_image_original_bytes:
+        return Response(content=last_image_original_bytes, media_type="image/jpeg")
+    return PlainTextResponse("No image captured yet", status_code=404)
+
+
+@app.get("/transformed.jpg")
+async def get_transformed_jpeg() -> Response:
+    """Return the last transformed JPEG."""
+    if last_image_transformed_bytes:
+        return Response(content=last_image_transformed_bytes, media_type="image/jpeg")
+    return PlainTextResponse("No image captured yet", status_code=404)
 
 
 @app.post("/toggle_auto")
@@ -578,21 +833,28 @@ async def toggle_auto() -> dict:
 @app.post("/capture_now")
 async def capture_now() -> RedirectResponse:
     """Manually capture and analyze a frame, then return to index to display images."""
-    global last_problem
-    last_problem = analyze_current_frame()
+    global last_problem, processing_state
+    processing_state = "analyzing"
+    try:
+        last_problem = analyze_current_frame()
+    finally:
+        processing_state = "idle"
     return RedirectResponse(url="/", status_code=303)
 
 
 @app.post("/send")
 async def send() -> RedirectResponse:
     """Send the last captured problem to the solver and return to index page."""
-    global last_answer
+    global last_answer, processing_state
     if last_problem:
-        last_answer = send_problem_to_chat(last_problem)
-        post_webhook(last_problem, last_answer)
+        processing_state = "solving"
+        try:
+            last_answer = send_problem_to_chat(last_problem)
+            post_webhook(last_problem, last_answer)
+        finally:
+            processing_state = "idle"
     else:
-        # If no problem captured yet, keep last_answer as-is
-        pass
+        processing_state = "idle"
     # Redirect back to the index so the page shows updated results
     return RedirectResponse(url="/", status_code=303)
 
